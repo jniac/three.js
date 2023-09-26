@@ -1,0 +1,557 @@
+<!DOCTYPE html>
+<html lang="en">
+	<head>
+		<title>three.js webgl - exr exporter</title>
+		<meta charset="utf-8">
+		<meta name="viewport" content="width=device-width, user-scalable=no, minimum-scale=1.0, maximum-scale=1.0">
+		<link type="text/css" rel="stylesheet" href="main.css">
+		<style>
+			#UI {
+				position: fixed;
+				top: 0;
+				left: 0;
+				width: 100%;
+				height: 100%;
+				pointer-events: none;
+				padding: 32px;
+			}
+			#UI > * {
+				pointer-events: all;
+			}
+		</style>
+	</head>
+
+	<body>
+		<div id="info">
+		</div>
+		
+		<div id="UI">
+			<svg width="256" height="256" viewBox="0 0 256 256" fill="none" xmlns="http://www.w3.org/2000/svg">
+				<rect width="256" height="256" fill="black"/>
+				<path d="M0 0H32L0 256H-32L0 0Z" fill="white"/>
+				<path d="M64 0H96L64 256H32L64 0Z" fill="white"/>
+				<path d="M128 0H160L128 256H96L128 0Z" fill="white"/>
+				<path d="M192 0H224L192 256H160L192 0Z" fill="white"/>
+				<path d="M256 0H288L256 256H224L256 0Z" fill="white"/>
+			</svg>
+		</div>
+			
+		<!-- Import maps polyfill -->
+		<!-- Remove this when import maps will be widely supported -->
+		<script async src="https://unpkg.com/es-module-shims@1.8.0/dist/es-module-shims.js"></script>
+
+		<script type="importmap">
+			{
+				"imports": {
+					"three": "../build/three.module.js",
+					"three/addons/": "./jsm/"
+				}
+			}
+		</script>
+
+		<script type="module">
+
+			import * as THREE from 'three';
+			import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+			import { EXRExporter } from 'three/addons/exporters/EXRExporter.js';
+			import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
+
+			class PseudoRandom {
+				static state = 123456;
+				static init( seed = 123456 ) {
+					PseudoRandom.state = seed > 1 && seed < 0x7fffffff ? seed & 0x7fffffff : 123456;
+				}
+				static next() {
+					PseudoRandom.state = Math.imul( PseudoRandom.state, 48271 );
+				  PseudoRandom.state &= 0x7fffffff;
+					return (PseudoRandom.state - 1) / 0x7ffffffe
+				}
+				static range(min = 0, max = 1) {
+					return min + (max - min) * PseudoRandom.next();
+				}
+			}
+
+			let renderer, camera, scene, environmentScene;
+
+			const exporter = new EXRExporter();
+
+			init();
+			updateWindow();
+			animate();
+
+			const params = {
+				cubeSize: 512,
+			};
+
+			const gui = new GUI();
+
+			gui.add( params, 'cubeSize', 2, 8192 ).name( 'Texture Cube Size' ).step( 1 );
+			gui.add( { export: renderToRenderTarget }, 'export' ).name( 'Export scene.exr (current frame)' );
+			gui.add( { export: renderEquirectangular }, 'export' ).name( 'Export env-long-lat.exr ' );
+			gui.add( { export: renderStripe }, 'export' ).name( 'Export env-stripe.exr ' );
+			gui.open();
+
+			function init() {
+				
+				function createEnvironment() {
+					
+					const scene = new THREE.Scene();
+					
+					// Walls:
+					const walls = new THREE.Mesh(
+						new THREE.BoxGeometry(10, 10, 10),
+						new THREE.MeshPhysicalMaterial( {
+							side: THREE.BackSide,
+						} ),
+					);
+					scene.add(walls);
+						
+					// Main light:
+					const pointLight = new THREE.PointLight( 0xffffff, 15 );
+					pointLight.position.set( 0, 3.5, -1 );
+					scene.add(pointLight);
+					
+					// Soft boxes:
+					let softBoxCount = 5;
+					const softBoxGeometry = new THREE.CircleGeometry( 1, 16 );
+					const softBoxMaterial = new THREE.ShaderMaterial( {
+						transparent: true,
+						depthTest: false,
+						vertexColor: true,
+						vertexShader: /* glsl */`
+							varying vec3 vPosition, vColor;
+
+							void main() {
+								vColor = instanceColor;
+								vPosition = position;
+								vec4 mvPosition = modelViewMatrix * instanceMatrix * vec4( position, 1.0 );
+								gl_Position = projectionMatrix * mvPosition;
+							}								
+						`,
+						fragmentShader: /* glsl */`
+							varying vec3 vPosition, vColor;
+
+							void main() {
+								gl_FragColor.rgb = vColor;
+								gl_FragColor.a = pow( 1.0 - length( vPosition ), 2.0 );
+							}
+						`
+					} );
+					const softBoxes = new THREE.InstancedMesh(softBoxGeometry, softBoxMaterial, softBoxCount);
+					const matrix = new THREE.Matrix4();
+					const position = new THREE.Vector3();
+					const center = new THREE.Vector3();
+					const up = new THREE.Vector3( 0, 1, 0 );
+					const color = new THREE.Color();
+					PseudoRandom.init(342432);
+					for ( let i = 0; i < softBoxCount; i++ ) {
+						// Position:
+						position.x = PseudoRandom.range( -4, 4 );
+						position.y = PseudoRandom.range( -1, 4 );
+						position.z = PseudoRandom.range( -4, 4 );
+						matrix.lookAt( center, position, up );
+						const scale = PseudoRandom.range( 0.5, 4 );
+						matrix.elements[ 0 ] *= scale;
+						matrix.elements[ 1 ] *= scale;
+						matrix.elements[ 2 ] *= scale;
+						matrix.elements[ 4 ] *= scale;
+						matrix.elements[ 5 ] *= scale;
+						matrix.elements[ 6 ] *= scale;
+						matrix.elements[ 8 ] *= scale;
+						matrix.elements[ 9 ] *= scale;
+						matrix.elements[ 10 ] *= scale;
+						matrix.elements[ 12 ] = position.x;
+						matrix.elements[ 13 ] = position.y;
+						matrix.elements[ 14 ] = position.z;
+						softBoxes.setMatrixAt( i, matrix );
+						// Color:
+						const intensity = PseudoRandom.range( 0.5, 4.0 );
+						color.r = PseudoRandom.range( 0.8, 1 ) * intensity;
+						color.g = PseudoRandom.range( 0.8, 1 ) * intensity;
+						color.b = PseudoRandom.range( 0.8, 1 ) * intensity;
+						softBoxes.setColorAt( i, color );
+					}
+					scene.add(softBoxes);
+
+					// Debug texts:
+					function createDebugTexts() {
+						const texts = new THREE.Group()
+						const dash = (parent, quarter, length, color) => {
+							const mesh = new THREE.Mesh(
+								new THREE.BoxGeometry(length, .04, .04),
+								new THREE.MeshBasicMaterial({ color }),
+							)
+							mesh.rotation.z = Math.PI / 2 * quarter
+							parent.add(mesh)
+							return mesh
+						}
+						const dot = (parent, color) => {
+							const mesh = new THREE.Mesh(
+								new THREE.CircleGeometry(.03),
+								new THREE.MeshBasicMaterial({ color }),
+							)
+							parent.add(mesh)
+							return mesh
+						}
+						
+						const px = new THREE.Group()
+						px.position.set(1, 0, 0)
+						px.rotation.set(0, -Math.PI / 2, 0)
+						texts.add(px)
+						dash(px, 0, .2, 'red').position.set(-.1, 0, 0)
+						dash(px, 1, .2, 'red').position.set(-.1, 0, 0)
+						dash(px, .5, .3, 'red').position.set(.1, 0, 0)
+						dash(px, -.5, .3, 'red').position.set(.1, 0, 0)
+						dot(px, 'red').position.set(0, -.25, 0)
+
+						const nx = new THREE.Group()
+						nx.position.set(-1, 0, 0)
+						nx.rotation.set(0, Math.PI / 2, 0)
+						texts.add(nx)
+						dash(nx, 0, .2, 'red').position.set(-.1, 0, 0)
+						dash(nx, .5, .3, 'red').position.set(.1, 0, 0)
+						dash(nx, -.5, .3, 'red').position.set(.1, 0, 0)
+						dot(nx, 'red').position.set(0, -.25, 0)
+
+						const py = new THREE.Group()
+						py.position.set(0, 1, 0)
+						py.rotation.set(Math.PI / 2, 0, 0)
+						texts.add(py)
+						dash(py, 0, .2, 'green').position.set(-.1, 0, 0)
+						dash(py, 1, .2, 'green').position.set(-.1, 0, 0)
+						dash(py, .5, .15, 'green').position.set(.15, .066, 0)
+						dash(py, -.5, .15, 'green').position.set(.05, .066, 0)
+						dash(py, 1, .15, 'green').position.set(.1, -.05, 0)
+						dot(py, 'green').position.set(0, -.25, 0)
+						
+						const ny = new THREE.Group()
+						ny.position.set(0, -1, 0)
+						ny.rotation.set(-Math.PI / 2, 0, 0)
+						texts.add(ny)
+						dash(ny, 0, .2, 'green').position.set(-.1, 0, 0)
+						dash(ny, .5, .15, 'green').position.set(.15, .066, 0)
+						dash(ny, -.5, .15, 'green').position.set(.05, .066, 0)
+						dash(ny, 1, .15, 'green').position.set(.1, -.05, 0)
+						dot(ny, 'green').position.set(0, -.25, 0)
+
+						const pz = new THREE.Group()
+						pz.position.set(0, 0, 1)
+						pz.rotation.set(0, Math.PI, 0)
+						texts.add(pz)
+						dash(pz, 0, .2, 'blue').position.set(-.1, 0, 0)
+						dash(pz, 1, .2, 'blue').position.set(-.1, 0, 0)
+						dash(pz, 0, .2, 'blue').position.set(.1, .1, 0)
+						dash(pz, 0, .2, 'blue').position.set(.1, -.1, 0)
+						dash(pz, .5, .24, 'blue').position.set(.1, 0, 0)
+						dot(pz, 'blue').position.set(0, -.25, 0)
+
+						const nz = new THREE.Group()
+						nz.position.set(0, 0, -1)
+						texts.add(nz)
+						dash(nz, 0, .2, 'blue').position.set(-.1, 0, 0)
+						dash(nz, 0, .2, 'blue').position.set(.1, .1, 0)
+						dash(nz, 0, .2, 'blue').position.set(.1, -.1, 0)
+						dash(nz, .5, .24, 'blue').position.set(.1, 0, 0)
+						dot(nz, 'blue').position.set(0, -.25, 0)
+
+						// const fontLoader = new FontLoader()
+						// fontLoader.load(config.publicAssets('misc/helvetiker_bold.typeface.json'), font => {
+						//   const shapes = font.generateShapes('+X', 1)
+						//   const geometry = new ShapeGeometry(shapes)
+						//   geometry.computeBoundingBox()
+						//   console.log(geometry.boundingBox)
+						//   const material = new MeshBasicMaterial({ color: 'red' })
+						//   const mesh = new THREE.Mesh(geometry, material)
+						//   mesh.position.set(0, 0, -2)
+						//   texts.add(mesh)
+						// })
+						return texts
+					}
+					scene.add( createDebugTexts() );
+	
+					return scene
+				}
+
+				function createEnvironmentTexture() {
+					const pmremGenerator = new THREE.PMREMGenerator( renderer );
+					pmremGenerator.compileCubemapShader();
+					const rt = pmremGenerator.fromScene( environmentScene );
+					return rt.texture;
+				}
+	
+				function createKnot( { x = 0, y = 0, z = 0, color = 'white', roughness = .5 } = {} ) {
+	
+					const geometry = new THREE.TorusKnotGeometry( 1, 0.5, 256, 16 );
+					const material = new THREE.MeshPhysicalMaterial( {
+						metalness: 1,
+						roughness: .1,
+					} );
+					const knot = new THREE.Mesh( geometry, material );
+					knot.position.set( x, y, z );
+					return knot;
+					
+				}
+	
+				function createBall( { x = 0, y = 0, z = 0, color = 'white', metalness = 1, roughness = .5, roughnessMap = undefined } = {} ) {
+	
+					const geometry = new THREE.IcosahedronGeometry( 1, 8 );
+					const material = new THREE.MeshPhysicalMaterial( {
+						color,
+						metalness,
+						roughness,
+						roughnessMap,
+					} );
+					const ball = new THREE.Mesh( geometry, material );
+					ball.position.set( x, y, z );
+					return ball;
+					
+				}
+	
+				renderer = new THREE.WebGLRenderer();
+				renderer.setPixelRatio( window.devicePixelRatio );
+				document.body.appendChild( renderer.domElement );
+
+				camera = new THREE.PerspectiveCamera( 60, window.innerWidth / window.innerHeight, 0.1, 1000 );
+
+				environmentScene = createEnvironment();
+				const environmentTexture = createEnvironmentTexture();
+
+				scene = new THREE.Scene();
+				scene.environment = environmentTexture;
+				scene.background = environmentTexture;
+
+				scene.add( createKnot() );
+				scene.add( createBall( { x: 3.5, color: '#0099ff' } ) );
+				scene.add( createBall( { 
+					y: 3.5,
+					color: '#0099ff',
+					roughness: 1,
+					// roughnessMap: new THREE.CanvasTexture(document.querySelector('svg')),
+					metalness: .1,
+				} ) );
+				scene.add( createBall( { x: -3.5, color: '#ffcc00', roughness: .2 } ) );
+				scene.add( createBall( { y: -3.5, color: '#ffcc00', roughness: 0, metalness: 0 } ) );
+
+				const controls = new OrbitControls( camera, renderer.domElement );
+				controls.minDistance = 5;
+				controls.maxDistance = 75;
+
+			}
+
+			function renderToRenderTarget() {
+
+				const rt = new THREE.WebGLRenderTarget( window.innerWidth, window.innerHeight, { type: THREE.HalfFloatType } );
+				renderer.clear();
+				renderer.setRenderTarget( rt );
+				renderer.render( scene, camera );
+				renderer.setRenderTarget( null );
+
+				const buffer = exporter.parse( renderer, rt );
+				const blob = new Blob( [ buffer ], { type: 'application/octet-stream' } );
+
+				downloadFile( blob, 'scene.exr' );
+
+				rt.texture.dispose();
+
+			}
+
+			function createCubeRenderTarget() {
+				
+				const cubeRenderTarget = new THREE.WebGLCubeRenderTarget( params.cubeSize, {
+					generateMipmaps: false,
+					type: THREE.FloatType,
+				} );
+	
+				const cubeCamera = new THREE.CubeCamera( 0.1, 100, cubeRenderTarget );
+				cubeCamera.update( renderer, environmentScene );
+
+				return cubeRenderTarget;
+			}
+
+			function renderEquirectangular() {
+
+				const size = new THREE.Vector2( 4 * params.cubeSize, 2 * params.cubeSize )
+				const cubeRenderTarget = createCubeRenderTarget();
+				const orthoCamera = new THREE.OrthographicCamera( -1, 1, 1, -1, -1, 1 );
+				const orthoScene = new THREE.Scene();
+				const plane = new THREE.Mesh(
+					new THREE.PlaneGeometry(2, 2),
+					new THREE.ShaderMaterial({
+						uniforms: {
+							uCubeMap: { value: cubeRenderTarget.texture },
+							uSize: { value: size },
+						},
+						vertexShader: /* glsl */`
+							void main() {
+								gl_Position = vec4( position, 1.0 );
+							}
+						`,
+						fragmentShader: /* glsl */`
+							uniform vec2 uSize;
+							uniform samplerCube uCubeMap;
+
+							vec3 toDirection(vec2 longLat) {
+								float cosLat = cos(longLat.y);
+								return vec3(
+									cosLat * cos(longLat.x),
+									sin(longLat.y),
+									cosLat * sin(longLat.x));
+							}
+
+							void main() {
+								vec2 longLat = ( gl_FragCoord.xy / uSize - 0.5 ) * vec2( 2.0, 1.0 ) * 3.141592653589793;
+								vec3 direction = toDirection( longLat );
+								gl_FragColor = texture( uCubeMap, direction );
+							}
+						`,
+					}),
+				);
+				orthoScene.add( plane );
+
+				const rt = new THREE.WebGLRenderTarget( size.x, size.y, {
+					type: THREE.FloatType,
+				} );
+				renderer.clear();
+				renderer.setRenderTarget( rt );
+				renderer.render( orthoScene, orthoCamera );
+				renderer.setRenderTarget( null );
+
+				const buffer = exporter.parse( renderer, rt );
+				const blob = new Blob( [ buffer ], { type: 'application/octet-stream' } );
+
+				downloadFile( blob, 'env-long-lat.exr' );
+
+			}
+
+			function renderStripe() {
+
+				const size = new THREE.Vector2( 6 * params.cubeSize, params.cubeSize );		
+				const cubeRenderTarget = createCubeRenderTarget();
+				const orthoCamera = new THREE.OrthographicCamera( -1, 1, 1, -1, -1, 1 );
+				const orthoScene = new THREE.Scene();
+				const plane = new THREE.Mesh(
+					new THREE.PlaneGeometry(2, 2),
+					new THREE.ShaderMaterial({
+						uniforms: {
+							uCubeMap: { value: cubeRenderTarget.texture },
+							uSize: { value: size },
+						},
+						vertexShader: /* glsl */`
+							void main() {
+								gl_Position = vec4( position, 1.0 );
+							}
+						`,
+						fragmentShader: /* glsl */`
+							uniform vec2 uSize;
+							uniform samplerCube uCubeMap;
+
+							vec3 directionX(vec2 coords, float x) {
+								coords = coords * 2.0 - 1.0;
+								return normalize( vec3(
+									x, 
+									coords.y, 
+									x * coords.x ) );
+								}
+								
+							vec3 directionY(vec2 coords, float y) {
+								coords = coords * 2.0 - 1.0;
+								return normalize( vec3(
+									coords.x, 
+									y, 
+									y * coords.y ) );
+							}
+								
+							vec3 directionZ(vec2 coords, float z) {
+								coords = coords * 2.0 - 1.0;
+								return normalize( vec3(
+									-z * coords.x, 
+									coords.y, 
+									z ) );
+							}
+								
+							void main() {
+								float face = gl_FragCoord.x / uSize.x * 6.0;
+								vec2 coords = gl_FragCoord.xy / uSize;
+								coords.x *= 6.0;
+								if (face < 1.0) {
+									coords.x += -0.0;
+									gl_FragColor = texture( uCubeMap, directionX(coords, -1.0) );
+								} else if (face < 2.0) {
+									coords.x += -1.0;
+									gl_FragColor = texture( uCubeMap, directionX(coords, 1.0) );
+								} else if (face < 3.0) {
+									coords.x += -2.0;
+									gl_FragColor = texture( uCubeMap, directionY(coords, -1.0) );
+								} else if (face < 4.0) {
+									coords.x += -3.0;
+									gl_FragColor = texture( uCubeMap, directionY(coords, 1.0) );
+								} else if (face < 5.0) {
+									coords.x += -4.0;
+									gl_FragColor = texture( uCubeMap, directionZ(coords, -1.0) );
+								} else {
+									coords.x += -5.0;
+									gl_FragColor = texture( uCubeMap, directionZ(coords, 1.0) );
+								}
+							}
+						`,
+					}),
+				);
+				orthoScene.add( plane );
+				
+				const rt = new THREE.WebGLRenderTarget( size.x, size.y, {
+					type: THREE.FloatType,
+				} );
+				renderer.clear();
+				renderer.setRenderTarget( rt );
+				renderer.render( orthoScene, orthoCamera );
+				renderer.setRenderTarget( null );
+
+				const buffer = exporter.parse( renderer, rt );
+				const blob = new Blob( [ buffer ], { type: 'application/octet-stream' } );
+
+				downloadFile( blob, 'env-stripe-horizontal.exr' );
+
+			}
+
+			function downloadFile( blob, filename ) {
+
+				const a = document.createElement( 'a' );
+				a.href = window.URL.createObjectURL(blob);
+				a.download = filename;
+				a.click();
+				window.URL.revokeObjectURL(blob);
+
+			}
+
+			function updateWindow() {
+
+				camera.aspect = window.innerWidth / window.innerHeight;
+				camera.position.set( 0, 0, 10 );
+				camera.updateProjectionMatrix();
+
+				renderer.setSize( window.innerWidth, window.innerHeight );
+
+			}
+
+			//
+
+			function animate() {
+
+				requestAnimationFrame( animate );
+
+				render();
+
+			}
+
+			function render() {
+
+				renderer.render( scene, camera );
+
+			}
+
+			Object.assign(window, { THREE, renderer } );
+
+		</script>
+
+	</body>
+</html>
